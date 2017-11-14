@@ -1,58 +1,79 @@
 FROM ubuntu:16.04
 
-RUN apt-get update && apt-get install -y \
-    postgresql \
-    postgresql-client \
-    libpq-dev \
-    python3 \
-    python3-pip \
-    python3-dev \
-    libffi-dev \
-    libjpeg-dev \
-    git \
-    nginx \
-    redis-server \
-    ffmpeg && \
-    echo "vm.overcommit_memory = 1" >> /etc/systcl.conf
-
-RUN git clone https://github.com/cgwire/zou.git /opt/zou && \
-    git clone -b build https://github.com/cgwire/kitsu.git /opt/kitsu && \
-    cd /opt/zou && \
-    python3 setup.py install && \
-    pip3 install gunicorn && \
-    pip3 install gevent
-
-USER postgres
-
-RUN \
-    service postgresql start && \
-    psql -c 'create database zoudb;' -U postgres && \
-    psql --command "ALTER USER postgres WITH PASSWORD 'mysecretpassword';" && \
-    service postgresql stop
-
 USER root
 
-COPY ./gunicorn /etc/zou/gunicorn.conf
-COPY ./zou.service /etc/systemd/
-RUN mkdir /opt/zou/logs
+# Add Tini
+ENV TINI_VERSION v0.16.1
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini.asc /tini.asc
+RUN gpg --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 595E85A6B1B4779EA4DAAEC70B588DFF0527A9B7 \
+    && gpg --verify /tini.asc
+RUN chmod +x /tini
+
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    bzip2 \
+    ffmpeg \
+    git \
+    nginx \
+    postgresql \
+    postgresql-client \
+    python-pip \
+    python-setuptools \
+    python3 \
+    python3-pip \
+    python3-setuptools \
+    python3-venv \
+    python3-wheel \
+    redis-server && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/zou /var/log/zou
+
+RUN git clone --depth 1 https://github.com/cgwire/zou.git /opt/zou/zou && \
+    git clone -b build --depth 1 https://github.com/cgwire/kitsu.git /opt/zou/kitsu
+
+# setup.py will read requirements.txt in the current directory
+WORKDIR /opt/zou/zou
+RUN python3 -m venv /opt/zou/env && \
+    # Python 2 needed for supervisord
+    /opt/zou/env/bin/pip install --upgrade pip setuptools wheel && \
+    # Install dependencies using pip in order to use wheel
+    /opt/zou/env/bin/pip install -r /opt/zou/zou/requirements.txt && \
+    /opt/zou/env/bin/python /opt/zou/zou/setup.py install && \
+    rm -rf /root/.cache/pip/
 
 WORKDIR /opt/zou
+
+# Create database
+RUN service postgresql start && \
+    su - postgres -c 'createuser root && createdb -T template0 -E UTF8 --owner root zoudb' && \
+    service postgresql stop
+
+# Wait for the startup or shutdown to complete
+COPY pg_ctl.conf /etc/postgresql/9.5/main/pg_ctl.conf
+RUN chmod 0644 /etc/postgresql/9.5/main/pg_ctl.conf && chown postgres:postgres /etc/postgresql/9.5/main/pg_ctl.conf
+
+COPY ./gunicorn /etc/zou/gunicorn.conf
 COPY ./gunicorn-events /etc/zou/gunicorn-events.conf
-COPY ./zou-events.service /etc/systemd/system/
-COPY ./init_zou.sh .
-COPY ./start_zou.sh .
-RUN chmod +x init_zou.sh start_zou.sh
 
-COPY ./nginx /etc/nginx/sites-available/zou
+COPY ./nginx.conf /etc/nginx/sites-available/zou
 RUN ln -s /etc/nginx/sites-available/zou /etc/nginx/sites-enabled/
-
 RUN rm /etc/nginx/sites-enabled/default
 
-RUN \
-  echo Initialising Zou.. && \
-  ./init_zou.sh
+# supervisor will manage services
+RUN pip install supervisor
+ADD supervisord.conf /etc/supervisord.conf
+
+ENV DB_USERNAME=root DB_HOST=
+COPY ./init_zou.sh /opt/zou/
+COPY ./start_zou.sh /opt/zou/
+RUN chmod +x /opt/zou/init_zou.sh /opt/zou/start_zou.sh
+
+RUN echo Initialising Zou... && \
+    /opt/zou/init_zou.sh
 
 EXPOSE 80
 
-ENTRYPOINT \
-  /opt/zou/start_zou.sh
+ENTRYPOINT ["/tini", "--"]
+CMD ["/opt/zou/start_zou.sh"]
