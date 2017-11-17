@@ -1,58 +1,79 @@
 FROM ubuntu:16.04
 
-RUN apt-get update && apt-get install -y \
+USER root
+
+# Add Tini
+ENV TINI_VERSION v0.16.1
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini.asc /tini.asc
+RUN gpg --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 595E85A6B1B4779EA4DAAEC70B588DFF0527A9B7 \
+    && gpg --verify /tini.asc
+RUN chmod +x /tini
+
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    bzip2 \
+    ffmpeg \
+    git \
+    nginx \
     postgresql \
     postgresql-client \
-    libpq-dev \
+    python-pip \
+    python-setuptools \
     python3 \
     python3-pip \
-    python3-dev \
-    libffi-dev \
-    libjpeg-dev \
-    git \
-    nginx
+    python3-setuptools \
+    python3-venv \
+    python3-wheel \
+    redis-server && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/cgwire/zou.git /opt/zou && \
-    git clone -b build https://github.com/cgwire/kitsu.git /opt/kitsu && \
-    cd /opt/zou && \
-    python3 setup.py install && \
-    pip3 install \
-        gunicorn \
-        gevent
+RUN mkdir -p /opt/zou /var/log/zou
 
-COPY gunicorn /etc/zou/gunicorn.conf
-COPY nginx /etc/nginx/sites-available/zou
+RUN git clone --depth 1 https://github.com/cgwire/zou.git /opt/zou/zou && \
+    git clone -b build --depth 1 https://github.com/cgwire/kitsu.git /opt/zou/kitsu
 
-RUN useradd --home /opt/zou zou && \
-    mkdir /opt/zou/logs && \
-    chown zou: /opt/zou/logs && \
-    chown -R zou:www-data /opt/kitsu && \
-    chown -R zou:www-data /opt/zou && \
-    rm /etc/nginx/sites-enabled/default && \
-    ln -s /etc/nginx/sites-available/zou /etc/nginx/sites-enabled
+# setup.py will read requirements.txt in the current directory
+WORKDIR /opt/zou/zou
+RUN python3 -m venv /opt/zou/env && \
+    # Python 2 needed for supervisord
+    /opt/zou/env/bin/pip install --upgrade pip setuptools wheel && \
+    # Install dependencies using pip in order to use wheel
+    /opt/zou/env/bin/pip install -r /opt/zou/zou/requirements.txt && \
+    /opt/zou/env/bin/python /opt/zou/zou/setup.py install && \
+    rm -rf /root/.cache/pip/
 
-USER postgres
-
-RUN service postgresql start && \
-    psql --command "create database zoudb;" -U postgres && \
-    psql --command "ALTER USER postgres WITH PASSWORD 'mysecretpassword';"
-
-USER root
 WORKDIR /opt/zou
 
-# About Gunicorn and port 5000
-# Gunicorn is being reverse-proxied through Nginx,
-# which is ultimately the process serving port 80
-ENTRYPOINT \
-    service nginx start && \
-    service postgresql start && \
-    echo Initialising Zou.. && \
-    sleep 5 && \
-    zou init_db && \
-    zou init_data && \
-    zou create_admin && \
-    echo Running Zou.. && \
-    gunicorn \
-        -c /etc/zou/gunicorn.conf \
-        -b 0.0.0.0:5000 \
-        wsgi:application 
+# Create database
+RUN service postgresql start && \
+    su - postgres -c 'createuser root && createdb -T template0 -E UTF8 --owner root zoudb' && \
+    service postgresql stop
+
+# Wait for the startup or shutdown to complete
+COPY pg_ctl.conf /etc/postgresql/9.5/main/pg_ctl.conf
+RUN chmod 0644 /etc/postgresql/9.5/main/pg_ctl.conf && chown postgres:postgres /etc/postgresql/9.5/main/pg_ctl.conf
+
+COPY ./gunicorn /etc/zou/gunicorn.conf
+COPY ./gunicorn-events /etc/zou/gunicorn-events.conf
+
+COPY ./nginx.conf /etc/nginx/sites-available/zou
+RUN ln -s /etc/nginx/sites-available/zou /etc/nginx/sites-enabled/
+RUN rm /etc/nginx/sites-enabled/default
+
+# supervisor will manage services
+RUN pip install supervisor
+ADD supervisord.conf /etc/supervisord.conf
+
+ENV DB_USERNAME=root DB_HOST=
+COPY ./init_zou.sh /opt/zou/
+COPY ./start_zou.sh /opt/zou/
+RUN chmod +x /opt/zou/init_zou.sh /opt/zou/start_zou.sh
+
+RUN echo Initialising Zou... && \
+    /opt/zou/init_zou.sh
+
+EXPOSE 80
+
+ENTRYPOINT ["/tini", "--"]
+CMD ["/opt/zou/start_zou.sh"]
